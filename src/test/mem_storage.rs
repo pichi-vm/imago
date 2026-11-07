@@ -24,6 +24,12 @@ pub struct MemStorageState {
     /// Physical reclaims with a snapshot of durable metadata at the time.
     pub reclaimed: Mutex<Vec<(u64, u64, Vec<u8>)>>,
 
+    /// Inject a sync failure before reclaim.
+    pub fail_next_sync: AtomicBool,
+
+    /// Inject a physical reclaim failure.
+    pub fail_next_reclaim: AtomicBool,
+
     /// Storage contents.
     pub data: Mutex<Vec<u8>>,
 
@@ -285,11 +291,17 @@ impl Storage for MemStorage {
     }
 
     async fn sync(&self) -> io::Result<()> {
+        if self.state.fail_next_sync.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("Injected sync failure"));
+        }
         *self.state.durable.lock() = self.state.data.lock().clone();
         Ok(())
     }
 
     async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        if self.state.fail_next_reclaim.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("Injected reclaim failure"));
+        }
         self.state
             .reclaimed
             .lock()

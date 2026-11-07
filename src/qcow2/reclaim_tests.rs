@@ -3,6 +3,7 @@
 use super::*;
 use crate::test::mem_storage::{MemStorage, MemStorageState};
 use crate::{DenyImplicitOpenGate, Mapping};
+use std::sync::atomic::Ordering;
 
 #[maybe_async]
 async fn create_image(
@@ -67,6 +68,30 @@ async fn test_reclaim_is_opt_in_and_preserves_neighbors() {
         let mut neighbor = [0; 4096];
         image.read(&mut neighbor[..], 4096).await.unwrap();
         assert!(neighbor.iter().all(|b| *b == 0x5a));
+        image.flush().await.unwrap();
+    }
+}
+
+#[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+async fn test_failed_barrier_or_punch_never_reuses_the_allocation() {
+    for fail_sync in [true, false] {
+        let state = Arc::new(MemStorageState::default());
+        let mut image = create_image(&state, true, 1).await;
+        image.write(&vec![0x5a; 4096][..], 0).await.unwrap();
+        image.flush().await.unwrap();
+        image.sync().await.unwrap();
+        let old = host_offset(&image, 0).await;
+        if fail_sync {
+            state.fail_next_sync.store(true, Ordering::Relaxed);
+        } else {
+            state.fail_next_reclaim.store(true, Ordering::Relaxed);
+        }
+        let result = image.discard_to_zero(0, 4096).await;
+        assert!(result.is_err());
+        assert!(state.reclaimed.lock().is_empty());
+        image.write(&vec![0xa5; 4096][..], 4096).await.unwrap();
+        let allocated = host_offset(&image, 4096).await;
+        assert_ne!(allocated, old);
         image.flush().await.unwrap();
     }
 }
