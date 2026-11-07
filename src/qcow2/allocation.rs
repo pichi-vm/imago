@@ -252,16 +252,16 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
     /// Free all clusters in `self.clusters_to_free`.
     ///
-    /// Best-effort operation, like [`Allocator::process_clusters_to_free()`].
-    pub(super) async fn process_clusters_to_free(&self) {
+    /// Allocator cleanup remains best effort; report errors obtaining it.
+    pub(super) async fn process_clusters_to_free(&self) -> io::Result<()> {
         // Skip taking the allocator lock if there is nothing to do
         if self.clusters_to_free.is_empty() {
-            return;
+            return Ok(());
         }
 
-        if let Ok(mut allocator) = self.allocator().await {
-            allocator.process_clusters_to_free().await;
-        }
+        let mut allocator = self.allocator().await?;
+        allocator.process_clusters_to_free().await;
+        Ok(())
     }
 }
 
