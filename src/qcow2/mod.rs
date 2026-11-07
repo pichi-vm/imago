@@ -11,6 +11,8 @@ mod io_func;
 mod mappings;
 mod metadata;
 mod preallocation;
+#[cfg(test)]
+mod reclaim_tests;
 #[cfg(feature = "sync-wrappers")]
 mod sync_wrappers;
 mod types;
@@ -553,7 +555,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
                 )
             })?;
 
-        self.do_commit_data_mapping(*state).await;
+        self.do_commit_data_mapping(*state).await?;
         Ok(())
     }
 
@@ -628,7 +630,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
     async fn flush(&self) -> io::Result<()> {
         // Free what is pending before writing back the refblocks
-        self.process_clusters_to_free().await;
+        self.process_clusters_to_free().await?;
         self.caches.flush_all().await?;
         self.metadata.flush().await?;
         if let Some(storage) = self.storage.as_ref() {

@@ -18,6 +18,22 @@ use std::task::{Context, Poll, Waker};
 /// State shared between a [`MemStorage`] object and the test.
 #[derive(Debug, Default)]
 pub struct MemStorageState {
+    /// Last durable storage contents, captured by sync.
+    pub durable: Mutex<Vec<u8>>,
+    /// Physical reclaims with a snapshot of durable metadata at the time.
+    pub reclaimed: Mutex<Vec<(u64, u64, Vec<u8>)>>,
+    /// Inject a sync failure before reclaim.
+    pub fail_next_sync: AtomicBool,
+    /// Inject a physical reclaim failure.
+    pub fail_next_reclaim: AtomicBool,
+
+    /// Hold physical reclamation after submission to simulate cancellation.
+    #[cfg(feature = "async")]
+    pub hold_reclaim: AtomicBool,
+    /// Reclaims still submitted after their futures are dropped.
+    #[cfg(feature = "async")]
+    pub held_reclaims: Mutex<Vec<(u64, u64)>>,
+
     /// Storage contents.
     pub data: Mutex<Vec<u8>>,
 
@@ -111,6 +127,14 @@ impl MemStorageState {
         let held = mem::take(&mut *self.held.lock());
         for (offset, data) in held {
             self.write(offset, &data);
+        }
+    }
+
+    /// Complete deferred reclaim operations, including cancelled ones.
+    #[cfg(feature = "async")]
+    pub fn complete_held_reclaims(&self) {
+        for (offset, length) in mem::take(&mut *self.held_reclaims.lock()) {
+            self.write(offset, &vec![0; length as usize]);
         }
     }
 
@@ -279,12 +303,36 @@ impl Storage for MemStorage {
     }
 
     async fn sync(&self) -> io::Result<()> {
+        if self.state.fail_next_sync.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("Injected sync failure"));
+        }
+        *self.state.durable.lock() = self.state.data.lock().clone();
+        Ok(())
+    }
+
+    async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        #[cfg(feature = "async")]
+        if self.state.hold_reclaim.load(Ordering::Relaxed) {
+            self.state.held_reclaims.lock().push((offset, length));
+            std::future::pending::<()>().await;
+        }
+        if self.state.fail_next_reclaim.swap(false, Ordering::Relaxed) {
+            return Err(io::Error::other("Injected reclaim failure"));
+        }
+        self.state
+            .reclaimed
+            .lock()
+            .push((offset, length, self.state.durable.lock().clone()));
+        self.state.write(offset, &vec![0; length as usize]);
         Ok(())
     }
 
     async fn settle_writes(&self) -> io::Result<()> {
         #[cfg(feature = "async")]
-        self.state.complete_held_writes();
+        {
+            self.state.complete_held_writes();
+            self.state.complete_held_reclaims();
+        }
         Ok(())
     }
 

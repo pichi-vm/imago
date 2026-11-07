@@ -86,7 +86,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             }
 
             if let Some(prepared) = prepared {
-                self.do_commit_data_mapping(prepared).await;
+                self.do_commit_data_mapping(prepared).await?;
             }
 
             offset += flen;

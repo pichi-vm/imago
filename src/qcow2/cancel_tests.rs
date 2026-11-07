@@ -650,3 +650,33 @@ async fn test_parallel_write_with_several_allocations() {
     image.read(&mut buf[..], 4 * 512).await.unwrap();
     assert!(buf == [0x55u8; 2 * 512], "Data not read back correctly");
 }
+
+/// A cancelled physical punch must never target a newly reused cluster.
+#[tokio::test]
+async fn dropped_reclaim_keeps_cluster_unavailable() {
+    let state = Arc::new(MemStorageState::default());
+    let q = Qcow2::<MemStorage>::create_builder(MemStorage::new(state.clone(), false))
+        .cluster_size(4096)
+        .size(1024 * 1024)
+        .create_open(DenyImplicitOpenGate::default(), |s| {
+            Ok(Qcow2::<MemStorage>::builder(s).write(true).reclaim(true))
+        })
+        .await
+        .unwrap();
+    let mut image = FormatAccess::new(q);
+    image.write(&vec![0x5a; 4096][..], 0).await.unwrap();
+    image.flush().await.unwrap();
+    image.sync().await.unwrap();
+    let old = host_offset(&image, 0).await;
+    state.hold_reclaim.store(true, Ordering::Relaxed);
+    assert!(image.discard_to_zero(0, 4096).now_or_never().is_none());
+    assert_eq!(state.held_reclaims.lock().len(), 1);
+    state.hold_reclaim.store(false, Ordering::Relaxed);
+    image.write(&vec![0xa5; 4096][..], 4096).await.unwrap();
+    assert_ne!(host_offset(&image, 4096).await, old);
+    state.complete_held_reclaims();
+    let mut bytes = vec![0; 4096];
+    image.read(&mut bytes[..], 4096).await.unwrap();
+    assert!(bytes.iter().all(|b| *b == 0xa5));
+    image.flush().await.unwrap();
+}

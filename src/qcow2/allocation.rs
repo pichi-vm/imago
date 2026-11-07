@@ -119,6 +119,9 @@ impl ClustersToFreeEntry {
 
 /// Central facility for cluster allocation.
 pub(super) struct Allocator<S: Storage> {
+    /// Require physical reclamation of unused data.
+    pub(super) reclaim: bool,
+
     /// Qcow2 metadata file.
     file: Arc<S>,
 
@@ -145,7 +148,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
     /// Return the central allocator instance.
     ///
     /// Returns an error for read-only images.
-    async fn allocator(&self) -> io::Result<MutexGuard<'_, Allocator<S>>> {
+    pub(super) async fn allocator(&self) -> io::Result<MutexGuard<'_, Allocator<S>>> {
         Ok(self
             .allocator
             .as_ref()
@@ -252,15 +255,19 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
     /// Free all clusters in `self.clusters_to_free`.
     ///
-    /// Best-effort operation, like [`Allocator::process_clusters_to_free()`].
-    pub(super) async fn process_clusters_to_free(&self) {
+    /// Best effort by default; required reclamation propagates errors.
+    pub(super) async fn process_clusters_to_free(&self) -> io::Result<()> {
         // Skip taking the allocator lock if there is nothing to do
         if self.clusters_to_free.is_empty() {
-            return;
+            return Ok(());
         }
 
-        if let Ok(mut allocator) = self.allocator().await {
+        let mut allocator = self.allocator().await?;
+        if allocator.reclaim {
+            allocator.reclaim_clusters_to_free().await
+        } else {
             allocator.process_clusters_to_free().await;
+            Ok(())
         }
     }
 }
@@ -289,6 +296,7 @@ impl<S: Storage> Allocator<S> {
         .await?;
 
         Ok(Allocator {
+            reclaim: false,
             file: image,
             reftable,
             first_free_cluster: HostCluster(0),
@@ -351,6 +359,64 @@ impl<S: Storage> Allocator<S> {
         for entry in data_clusters {
             self.free_clusters(entry.first_cluster, entry.count).await;
         }
+    }
+
+    /// Persist removed references before freeing or punching any allocation.
+    /// The allocator lock serializes reuse. Retaining the last reference until
+    /// the punch completes also makes cancellation safe: dropped futures leak
+    /// the allocation rather than making an in-flight punch target reusable.
+    async fn reclaim_clusters_to_free(&mut self) -> io::Result<()> {
+        let entries = self.clusters_to_free.take();
+        self.file.settle_writes().await?;
+        self.caches.flush_all().await?;
+        self.file.flush().await?;
+        self.file.sync().await?;
+        self.caches.rb_depends_on_l2().await?;
+
+        let cb = self.header.cluster_bits();
+        for entry in entries {
+            for n in 0..entry.count.0 {
+                let cluster = entry.first_cluster + ClusterCount(n);
+                let (rt_index, rb_index) = cluster.rt_rb_indices(self.header.rb_bits());
+                let rb = self
+                    .get_rb(rt_index)
+                    .await?
+                    .ok_or_else(|| invalid_data("Missing refcount for released cluster"))?;
+                let count = rb.get(rb_index);
+                if count == 0 {
+                    return Err(invalid_data("Released cluster has zero refcount"));
+                }
+                if !entry.metadata && count == 1 {
+                    let align = self.file.discard_align() as u64;
+                    if !align.is_power_of_two() {
+                        return Err(invalid_data("Invalid storage discard alignment"));
+                    }
+                    let offset = cluster.offset(cb).0;
+                    let length = 1u64 << cb;
+                    // Round inward: never punch a neighboring allocation.
+                    let start = offset
+                        .checked_add(align - 1)
+                        .ok_or_else(|| invalid_data("Reclaim offset overflow"))?
+                        & !(align - 1);
+                    let end = offset
+                        .checked_add(length)
+                        .ok_or_else(|| invalid_data("Reclaim end overflow"))?
+                        & !(align - 1);
+                    if end > start {
+                        // Safe: all references have been durably removed and
+                        // the remaining refcount keeps this range unavailable.
+                        unsafe {
+                            self.file.pure_reclaim(start, end - start).await?;
+                        }
+                    }
+                }
+                rb.lock_write().await.decrement(rb_index)?;
+                if cluster < self.first_free_cluster {
+                    self.first_free_cluster = cluster;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Invaidate the refcount block cache.
@@ -843,6 +909,7 @@ mod tests {
         let old_reftable = RefTable::from_data(data.into_boxed_slice(), &header);
 
         let mut allocator = Allocator {
+            reclaim: false,
             file: Arc::clone(&null),
             reftable: old_reftable,
             first_free_cluster: rb_a_cluster,
