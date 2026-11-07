@@ -33,7 +33,9 @@ use tracing::{debug, warn};
 #[cfg(windows)]
 use windows_sys::Win32;
 #[cfg(windows)]
-use windows_sys::Win32::System::Ioctl::{FILE_ZERO_DATA_INFORMATION, FSCTL_SET_ZERO_DATA};
+use windows_sys::Win32::System::Ioctl::{
+    FILE_ZERO_DATA_INFORMATION, FSCTL_SET_SPARSE, FSCTL_SET_ZERO_DATA,
+};
 #[cfg(windows)]
 use windows_sys::Win32::System::IO::DeviceIoControl;
 
@@ -354,6 +356,31 @@ impl Storage for File {
         } else {
             Ok(())
         }
+    }
+
+    async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        #[cfg(windows)]
+        {
+            let file = self.file.read();
+            let mut returned = 0;
+            // Safe: File handle and returned-length pointer are valid; null input marks sparse.
+            let result = unsafe {
+                DeviceIoControl(
+                    file.as_raw_handle(),
+                    FSCTL_SET_SPARSE,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            if result == 0 {
+                return Err(Self::map_os_err(io::Error::last_os_error()));
+            }
+        }
+        self.discard_to_zero(offset, length).await
     }
 
     async fn flush(&self) -> io::Result<()> {
