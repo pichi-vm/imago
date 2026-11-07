@@ -252,7 +252,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
     /// Free all clusters in `self.clusters_to_free`.
     ///
-    /// Allocator cleanup remains best effort; report errors obtaining it.
+    /// Best effort by default; required reclamation propagates errors.
     pub(super) async fn process_clusters_to_free(&self) -> io::Result<()> {
         // Skip taking the allocator lock if there is nothing to do
         if self.clusters_to_free.is_empty() {
@@ -260,8 +260,12 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
         }
 
         let mut allocator = self.allocator().await?;
-        allocator.process_clusters_to_free().await;
-        Ok(())
+        if self.reclaim {
+            allocator.reclaim_clusters_to_free().await
+        } else {
+            allocator.process_clusters_to_free().await;
+            Ok(())
+        }
     }
 }
 
@@ -351,6 +355,44 @@ impl<S: Storage> Allocator<S> {
         for entry in data_clusters {
             self.free_clusters(entry.first_cluster, entry.count).await;
         }
+    }
+
+    /// Persist removed references before freeing or punching any allocation.
+    ///
+    /// The allocator lock serializes reuse.  Retaining the last reference until
+    /// the punch completes also makes cancellation safe: dropped futures leak
+    /// the allocation rather than making an in-flight punch target reusable.
+    async fn reclaim_clusters_to_free(&mut self) -> io::Result<()> {
+        let entries = self.clusters_to_free.take();
+        self.file.settle_writes().await?;
+        self.caches.flush_all().await?;
+        self.file.flush().await?;
+        self.file.sync().await?;
+        self.caches.rb_depends_on_l2().await?;
+
+        let cb = self.header.cluster_bits();
+        for entry in entries {
+            for n in 0..entry.count.0 {
+                let cluster = entry.first_cluster + ClusterCount(n);
+                let (rt_index, rb_index) = cluster.rt_rb_indices(self.header.rb_bits());
+                let rb = self
+                    .get_rb(rt_index)
+                    .await?
+                    .ok_or_else(|| invalid_data("Missing refcount for released cluster"))?;
+                let count = rb.get(rb_index);
+                if count == 0 {
+                    return Err(invalid_data("Released cluster has zero refcount"));
+                }
+                if !entry.metadata && count == 1 {
+                    self.file.reclaim(cluster.offset(cb).0, 1u64 << cb).await?;
+                }
+                rb.lock_write().await.decrement(rb_index)?;
+                if cluster < self.first_free_cluster {
+                    self.first_free_cluster = cluster;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Invaidate the refcount block cache.

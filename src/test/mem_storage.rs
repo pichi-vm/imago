@@ -18,8 +18,11 @@ use std::task::{Context, Poll, Waker};
 /// State shared between a [`MemStorage`] object and the test.
 #[derive(Debug, Default)]
 pub struct MemStorageState {
-    /// Ranges submitted for required reclamation.
-    pub reclaimed: Mutex<Vec<(u64, u64)>>,
+    /// Last durable storage contents, captured by sync.
+    pub durable: Mutex<Vec<u8>>,
+
+    /// Physical reclaims with a snapshot of durable metadata at the time.
+    pub reclaimed: Mutex<Vec<(u64, u64, Vec<u8>)>>,
 
     /// Storage contents.
     pub data: Mutex<Vec<u8>>,
@@ -281,13 +284,17 @@ impl Storage for MemStorage {
         Ok(())
     }
 
-    async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
-        self.state.reclaimed.lock().push((offset, length));
-        self.state.write(offset, &vec![0; length as usize]);
+    async fn sync(&self) -> io::Result<()> {
+        *self.state.durable.lock() = self.state.data.lock().clone();
         Ok(())
     }
 
-    async fn sync(&self) -> io::Result<()> {
+    async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        self.state
+            .reclaimed
+            .lock()
+            .push((offset, length, self.state.durable.lock().clone()));
+        self.state.write(offset, &vec![0; length as usize]);
         Ok(())
     }
 
