@@ -244,6 +244,20 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         Ok(())
     }
 
+    /// Release physical storage for an unused range, or return an error.
+    ///
+    /// Unlike `pure_discard`, silently doing nothing is not permitted. Filesystem
+    /// snapshots may retain the underlying blocks even after this file releases them.
+    ///
+    /// # Safety
+    /// The range must be aligned to `discard_align()` and have no live users.
+    /// As with other modifying operations, `settle_writes()` must cover requests
+    /// whose futures were dropped.
+    #[allow(async_fn_in_trait)]
+    async unsafe fn pure_reclaim(&self, _offset: u64, _length: u64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Flush internal buffers.
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether

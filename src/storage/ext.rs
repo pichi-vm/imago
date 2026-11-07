@@ -17,6 +17,23 @@ use tracing::trace;
 /// Provides some more convenient methods for accessing storage objects.
 #[maybe_async(AFIT)]
 pub trait StorageExt: Storage {
+    /// Physically reclaim an aligned range, failing if the backend cannot do so.
+    /// Exclusive access prevents concurrent users from retaining this range.
+    #[allow(async_fn_in_trait)]
+    async fn reclaim(&mut self, offset: u64, length: u64) -> io::Result<()> {
+        let align = self.discard_align() as u64;
+        if !align.is_power_of_two()
+            || offset & (align - 1) != 0
+            || length & (align - 1) != 0
+            || offset.checked_add(length).is_none()
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        self.settle_writes().await?;
+        // Safe: exclusive access, validated alignment and checked range.
+        unsafe { self.pure_reclaim(offset, length).await }
+    }
+
     /// Read data at `offset` into `bufv`.
     ///
     /// Reads until `bufv` is filled completely, i.e. will not do short reads.  When reaching the
