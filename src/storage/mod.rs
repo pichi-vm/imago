@@ -244,6 +244,25 @@ pub trait Storage: Debug + Display + Send + Sized + Sync {
         Ok(())
     }
 
+    /// Release physical storage for an unused range, or return an error.
+    ///
+    /// Unlike [`Self::pure_discard()`], silently doing nothing is not permitted.  Filesystem
+    /// snapshots may retain the underlying blocks even after this file releases them.
+    /// Parts of the range beyond the end of storage need not be reclaimed; this does not grow
+    /// storage.
+    ///
+    /// # Safety
+    /// The range must be aligned to [`Self::discard_align()`].  The same concurrency
+    /// requirements as for [`Self::pure_discard()`] apply.
+    /// As with other modifying operations, [`Self::settle_writes()`] must cover requests
+    /// whose futures were dropped.
+    ///
+    /// Use [`StorageExt::reclaim()`](crate::StorageExt::reclaim()) instead.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async unsafe fn pure_reclaim(&self, _offset: u64, _length: u64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Flush internal buffers.
     ///
     /// Does not necessarily sync those buffers to disk.  When using `flush()`, consider whether
@@ -437,6 +456,28 @@ pub trait DynStorage: Any + Debug + Display + Send + Sync {
     #[cfg(feature = "sync")]
     unsafe fn dyn_pure_discard(&self, offset: u64, length: u64) -> io::Result<()>;
 
+    /// Object-safe wrapper around [`Storage::pure_reclaim()`].
+    ///
+    /// # Safety
+    /// Same considerations as for [`Storage::pure_reclaim()`] apply.
+    #[cfg(feature = "async")]
+    unsafe fn dyn_pure_reclaim(
+        &self,
+        _offset: u64,
+        _length: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(async { Err(io::ErrorKind::Unsupported.into()) })
+    }
+
+    /// Object-safe wrapper around [`Storage::pure_reclaim()`].
+    ///
+    /// # Safety
+    /// Same considerations as for [`Storage::pure_reclaim()`] apply.
+    #[cfg(feature = "sync")]
+    unsafe fn dyn_pure_reclaim(&self, _offset: u64, _length: u64) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// Object-safe wrapper around [`Storage::flush()`].
     #[cfg(feature = "async")]
     fn dyn_flush(&self) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>>;
@@ -570,6 +611,10 @@ impl<S: Storage> Storage for &S {
         unsafe { (*self).pure_discard(offset, length).await }
     }
 
+    async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { (*self).pure_reclaim(offset, length).await }
+    }
+
     async fn flush(&self) -> io::Result<()> {
         (*self).flush().await
     }
@@ -692,6 +737,20 @@ impl<S: Storage + 'static> DynStorage for S {
     #[cfg(feature = "sync")]
     unsafe fn dyn_pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { <S as Storage>::pure_discard(self, offset, length) }
+    }
+
+    #[cfg(feature = "async")]
+    unsafe fn dyn_pure_reclaim(
+        &self,
+        offset: u64,
+        length: u64,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + '_>> {
+        Box::pin(unsafe { <S as Storage>::pure_reclaim(self, offset, length) })
+    }
+
+    #[cfg(feature = "sync")]
+    unsafe fn dyn_pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { <S as Storage>::pure_reclaim(self, offset, length) }
     }
 
     #[cfg(feature = "async")]
@@ -819,6 +878,10 @@ impl Storage for Box<dyn DynStorage> {
         unsafe { self.as_ref().dyn_pure_discard(offset, length).await }
     }
 
+    async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { self.as_ref().dyn_pure_reclaim(offset, length).await }
+    }
+
     async fn flush(&self) -> io::Result<()> {
         self.as_ref().dyn_flush().await
     }
@@ -906,6 +969,10 @@ impl Storage for Arc<dyn DynStorage> {
 
     async unsafe fn pure_discard(&self, offset: u64, length: u64) -> io::Result<()> {
         unsafe { self.as_ref().dyn_pure_discard(offset, length) }.await
+    }
+
+    async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        unsafe { self.as_ref().dyn_pure_reclaim(offset, length) }.await
     }
 
     async fn flush(&self) -> io::Result<()> {

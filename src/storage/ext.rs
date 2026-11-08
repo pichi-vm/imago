@@ -78,6 +78,15 @@ pub trait StorageExt: Storage {
     #[allow(async_fn_in_trait)] // No need for Send
     async fn discard(&self, offset: u64, length: u64) -> io::Result<()>;
 
+    /// Physically reclaim an aligned range, failing if the backend cannot do so.
+    ///
+    /// Uses the same write coordination as advisory discard.  Nonempty ranges must be aligned
+    /// to [`Storage::discard_align()`]; invalid alignment or overflow returns `InvalidInput`.
+    /// Empty ranges succeed without accessing storage.  Unlike [`Self::discard()`], unsupported
+    /// reclamation returns `Unsupported` instead of silently succeeding.
+    #[allow(async_fn_in_trait)] // No need for Send
+    async fn reclaim(&self, offset: u64, length: u64) -> io::Result<()>;
+
     /// Await concurrent strong write blockers for the given range.
     ///
     /// Strong write blockers are set up for writes that must not be intersected by any other
@@ -308,6 +317,25 @@ impl<S: Storage> StorageExt for S {
         Ok(())
     }
 
+    async fn reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        if length == 0 {
+            return Ok(());
+        }
+
+        let align = self.discard_align() as u64;
+        if !align.is_power_of_two()
+            || offset & (align - 1) != 0
+            || length & (align - 1) != 0
+            || offset.checked_add(length).is_none()
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let _guard = self.weak_write_blocker(offset..offset + length).await;
+        self.settle_writes().await?;
+        // Safe: Alignment and range checked, weak write blocker held.
+        unsafe { self.pure_reclaim(offset, length) }.await
+    }
+
     async fn weak_write_blocker(&self, range: Range<u64>) -> RangeBlockedGuard<'_> {
         self.get_storage_helper().weak_write_blocker(range).await
     }
@@ -471,6 +499,52 @@ mod tests {
     use super::*;
     use crate::test::mem_storage::{MemStorage, MemStorageState};
     use std::sync::Arc;
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn reclaim_requires_support_and_valid_ranges() {
+        let null = crate::null::Null::new(8192);
+        null.reclaim(1, 0).await.unwrap();
+        let result = null.reclaim(0, 4096).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Unsupported);
+
+        let mem = MemStorage::new(Arc::new(MemStorageState::default()), false).with_align(4096);
+        for (offset, length) in [(1, 4096), (0, 1), (u64::MAX - 4095, 4096)] {
+            let result = mem.reclaim(offset, length).await;
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        }
+    }
+
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn reclaim_is_forwarded_by_storage_wrappers() {
+        let state = Arc::new(MemStorageState::default());
+        let storage = MemStorage::new(Arc::clone(&state), false);
+        let borrowed = &storage;
+        StorageExt::reclaim(&borrowed, 0, 4096).await.unwrap();
+        let boxed: Box<dyn crate::DynStorage> = Box::new(storage);
+        boxed.reclaim(4096, 4096).await.unwrap();
+        let shared: Arc<dyn crate::DynStorage> =
+            Arc::new(MemStorage::new(Arc::clone(&state), false));
+        shared.reclaim(8192, 4096).await.unwrap();
+        let annotated =
+            crate::annotated::Annotated::new(MemStorage::new(Arc::clone(&state), false), 42);
+        annotated.reclaim(12288, 4096).await.unwrap();
+        assert_eq!(state.reclaimed.lock().len(), 4);
+    }
+
+    #[cfg(feature = "async")]
+    #[tokio::test]
+    async fn reclaim_waits_for_read_modify_write() {
+        use futures::FutureExt;
+
+        let state = Arc::new(MemStorageState::default());
+        let storage = MemStorage::new(Arc::clone(&state), false);
+        let guard = storage.strong_write_blocker(0..4096).await;
+        assert!(storage.reclaim(0, 4096).now_or_never().is_none());
+        assert!(state.reclaimed.lock().is_empty());
+        drop(guard);
+        storage.reclaim(0, 4096).await.unwrap();
+        assert_eq!(state.reclaimed.lock().len(), 1);
+    }
 
     /// Requests whose end, or padded end, is beyond `u64::MAX` must return an error.
     #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]

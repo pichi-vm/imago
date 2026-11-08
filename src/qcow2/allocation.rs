@@ -252,15 +252,19 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
 
     /// Free all clusters in `self.clusters_to_free`.
     ///
-    /// Best-effort operation, like [`Allocator::process_clusters_to_free()`].
-    pub(super) async fn process_clusters_to_free(&self) {
+    /// Best effort by default; required reclamation propagates errors.
+    pub(super) async fn process_clusters_to_free(&self) -> io::Result<()> {
         // Skip taking the allocator lock if there is nothing to do
         if self.clusters_to_free.is_empty() {
-            return;
+            return Ok(());
         }
 
-        if let Ok(mut allocator) = self.allocator().await {
+        let mut allocator = self.allocator().await?;
+        if self.reclaim {
+            allocator.reclaim_clusters_to_free().await
+        } else {
             allocator.process_clusters_to_free().await;
+            Ok(())
         }
     }
 }
@@ -351,6 +355,44 @@ impl<S: Storage> Allocator<S> {
         for entry in data_clusters {
             self.free_clusters(entry.first_cluster, entry.count).await;
         }
+    }
+
+    /// Persist removed references before freeing or punching any allocation.
+    ///
+    /// The allocator lock serializes reuse.  Retaining the last reference until
+    /// the punch completes also makes cancellation safe: dropped futures leak
+    /// the allocation rather than making an in-flight punch target reusable.
+    async fn reclaim_clusters_to_free(&mut self) -> io::Result<()> {
+        let entries = self.clusters_to_free.take();
+        self.file.settle_writes().await?;
+        self.caches.flush_all().await?;
+        self.file.flush().await?;
+        self.file.sync().await?;
+        self.caches.rb_depends_on_l2().await?;
+
+        let cb = self.header.cluster_bits();
+        for entry in entries {
+            for n in 0..entry.count.0 {
+                let cluster = entry.first_cluster + ClusterCount(n);
+                let (rt_index, rb_index) = cluster.rt_rb_indices(self.header.rb_bits());
+                let rb = self
+                    .get_rb(rt_index)
+                    .await?
+                    .ok_or_else(|| invalid_data("Missing refcount for released cluster"))?;
+                let count = rb.get(rb_index);
+                if count == 0 {
+                    return Err(invalid_data("Released cluster has zero refcount"));
+                }
+                if !entry.metadata && count == 1 {
+                    self.file.reclaim(cluster.offset(cb).0, 1u64 << cb).await?;
+                }
+                rb.lock_write().await.decrement(rb_index)?;
+                if cluster < self.first_free_cluster {
+                    self.first_free_cluster = cluster;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Invaidate the refcount block cache.
@@ -747,6 +789,63 @@ impl<S: Storage> Allocator<S> {
 mod tests {
     use super::*;
     use crate::null::Null;
+
+    /// Releasing one reference must preserve shared data until the last reference is removed.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_reclaim_preserves_shared_cluster() {
+        use crate::test::mem_storage::{MemStorage, MemStorageState};
+        use crate::DenyImplicitOpenGate;
+
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(&state), false))
+            .cluster_size(4096)
+            .size(1024 * 1024)
+            .create_open(DenyImplicitOpenGate::default(), |s| {
+                Ok(Qcow2::<MemStorage>::builder(s).write(true).reclaim(true))
+            })
+            .await
+            .unwrap();
+        let mut allocator = qcow2.allocator().await.unwrap();
+        let allocation = allocator
+            .allocate_clusters(ClusterCount(1), None, false)
+            .await
+            .unwrap();
+        let cluster = allocation.cluster();
+        allocation.make_persistent();
+        let offset = cluster.offset(qcow2.header.cluster_bits()).0;
+        qcow2
+            .metadata
+            .write(&[0x5a; 4096][..], offset)
+            .await
+            .unwrap();
+        let (rt_index, rb_index) = cluster.rt_rb_indices(qcow2.header.rb_bits());
+        let rb = allocator.get_rb(rt_index).await.unwrap().unwrap();
+        rb.lock_write().await.increment(rb_index).unwrap();
+        assert_eq!(rb.get(rb_index), 2);
+
+        qcow2
+            .clusters_to_free
+            .push(ClustersToFreeEntry::data(cluster, ClusterCount(1)));
+        allocator.reclaim_clusters_to_free().await.unwrap();
+        assert_eq!(rb.get(rb_index), 1);
+        assert!(state.reclaimed.lock().is_empty());
+        let mut bytes = [0; 4096];
+        qcow2.metadata.read(&mut bytes[..], offset).await.unwrap();
+        assert!(bytes.iter().all(|b| *b == 0x5a));
+
+        qcow2
+            .clusters_to_free
+            .push(ClustersToFreeEntry::data(cluster, ClusterCount(1)));
+        allocator.reclaim_clusters_to_free().await.unwrap();
+        assert_eq!(rb.get(rb_index), 0);
+        assert_eq!(state.reclaimed.lock().len(), 1);
+        {
+            let reclaimed = state.reclaimed.lock();
+            assert_eq!((reclaimed[0].0, reclaimed[0].1), (offset, 4096));
+        }
+        drop(allocator);
+        qcow2.flush().await.unwrap();
+    }
 
     /// Regression test for a bug in `Allocator::grow_reftable()`'s free-space search loop: when it
     /// hit a reftable index that had no refblock at all (i.e. a range that has never been

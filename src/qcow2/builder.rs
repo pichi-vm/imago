@@ -15,6 +15,9 @@ pub struct Qcow2OpenBuilder<S: Storage + 'static, F: WrappedFormat<S> + 'static 
     /// Basic options.
     base: FormatDriverBuilderBase<S>,
 
+    /// Require host reclamation when releasing data clusters.
+    reclaim: bool,
+
     /// Backing image
     ///
     /// `None` to open the image as specified by the image header, `Some(None)` to not open any
@@ -57,9 +60,22 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2OpenBuilder<S, F>
     fn with_base(base: FormatDriverBuilderBase<S>) -> Self {
         Qcow2OpenBuilder {
             base,
+            reclaim: false,
             backing: None,
             data_file: None,
         }
+    }
+
+    /// Require host reclamation when releasing data clusters.
+    ///
+    /// Disabled by default.  Storage must implement [`Storage::pure_reclaim()`].
+    /// Only complete data clusters with no remaining references are reclaimed.  External data
+    /// files and host discard alignments larger than the cluster size are not supported.
+    /// Reclamation errors are returned to the caller; affected allocations may be leaked safely
+    /// and recovered with an offline image check.
+    pub fn reclaim(mut self, enabled: bool) -> Self {
+        self.reclaim = enabled;
+        self
     }
 
     /// Set a backing image.
@@ -139,6 +155,26 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> FormatDriverBuilder<S>
         let metadata = self.base.open_image(&mut gate).await?;
 
         let mut qcow2 = Qcow2::<S, F>::do_open(metadata, writable, storage_opts.clone()).await?;
+        if self.reclaim {
+            if qcow2.header.external_data_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "Required reclamation of external data files is not implemented",
+                ));
+            }
+            let align = qcow2.metadata.discard_align();
+            if !align.is_power_of_two() || align > qcow2.header.cluster_size() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!(
+                        "Host discard alignment {align} is incompatible with cluster size {}",
+                        qcow2.header.cluster_size()
+                    ),
+                ));
+            }
+            qcow2.need_writable()?;
+            qcow2.reclaim = true;
+        }
 
         if let Some(backing) = self.backing {
             let backing = match backing {

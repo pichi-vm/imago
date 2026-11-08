@@ -161,7 +161,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 // Release what has been allocated so far
                 drop(l2_changes);
                 drop(l2_table);
-                self.process_clusters_to_free().await;
+                self.process_clusters_to_free().await?;
                 return Err(err);
             }
         };
@@ -180,7 +180,10 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
     /// Make a mapping prepared by [`Qcow2::do_prepare_data_mapping()`] visible.
     ///
     /// Underlying implementation for [`Qcow2::commit_data_mapping()`].
-    pub(super) async fn do_commit_data_mapping(&self, state: PreparedMappingState) {
+    pub(super) async fn do_commit_data_mapping(
+        &self,
+        state: PreparedMappingState,
+    ) -> io::Result<()> {
         let PreparedMappingState {
             mut l2_table,
             l2_changes,
@@ -194,7 +197,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
         }
         drop(l2_table);
 
-        self.process_clusters_to_free().await;
+        self.process_clusters_to_free().await
     }
 
     /// Make the given range be mapped by a fixed kind of clusters.
@@ -246,7 +249,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             .ensure_fixed_mapping_no_cleanup(first_cluster, cluster_count, mapping, l2_table)
             .await;
 
-        self.process_clusters_to_free().await;
+        self.process_clusters_to_free().await?;
 
         let count = res?;
 
@@ -343,7 +346,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
                 l2_offset.cluster(cb),
                 ClusterCount(1),
             ));
-            self.process_clusters_to_free().await;
+            self.process_clusters_to_free().await?;
         }
 
         let l2_table = Arc::new(l2_table);
@@ -376,7 +379,7 @@ impl<S: Storage, F: WrappedFormat<S>> Qcow2<S, F> {
             l1_locked.unset_cluster();
             self.clusters_to_free
                 .push(ClustersToFreeEntry::metadata(old_l1_cluster, old_l1_size));
-            self.process_clusters_to_free().await;
+            self.process_clusters_to_free().await?;
         }
 
         *l1_locked = new_l1;

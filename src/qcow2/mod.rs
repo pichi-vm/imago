@@ -11,6 +11,8 @@ mod io_func;
 mod mappings;
 mod metadata;
 mod preallocation;
+#[cfg(test)]
+mod reclaim_tests;
 #[cfg(feature = "sync-wrappers")]
 mod sync_wrappers;
 mod types;
@@ -52,6 +54,9 @@ pub struct Qcow2<S: Storage + 'static, F: WrappedFormat<S> + 'static = FormatAcc
 
     /// Whether this image may be modified.
     writable: bool,
+
+    /// Require host reclamation when releasing data clusters.
+    reclaim: bool,
 
     /// Whether the user explicitly assigned a data file storage object (or `None`).
     storage_set: bool,
@@ -140,6 +145,7 @@ impl<S: Storage + 'static, F: WrappedFormat<S> + 'static> Qcow2<S, F> {
             metadata,
 
             writable,
+            reclaim: false,
 
             storage_set: false,
             storage: None,
@@ -553,8 +559,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
                 )
             })?;
 
-        self.do_commit_data_mapping(*state).await;
-        Ok(())
+        self.do_commit_data_mapping(*state).await
     }
 
     async fn ensure_zero_mapping(&self, offset: u64, length: u64) -> io::Result<(u64, u64)> {
@@ -628,7 +633,7 @@ impl<S: Storage, F: WrappedFormat<S>> FormatDriverInstance for Qcow2<S, F> {
 
     async fn flush(&self) -> io::Result<()> {
         // Free what is pending before writing back the refblocks
-        self.process_clusters_to_free().await;
+        self.process_clusters_to_free().await?;
         self.caches.flush_all().await?;
         self.metadata.flush().await?;
         if let Some(storage) = self.storage.as_ref() {

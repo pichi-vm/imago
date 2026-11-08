@@ -162,6 +162,11 @@ impl<T: Debug + Default + Display + Send + Sync, S: Storage> Storage for Annotat
         unsafe { self.inner.pure_discard(offset, length) }.await
     }
 
+    async unsafe fn pure_reclaim(&self, offset: u64, length: u64) -> io::Result<()> {
+        // Caller guarantees safety
+        unsafe { self.inner.pure_reclaim(offset, length) }.await
+    }
+
     async fn flush(&self) -> io::Result<()> {
         self.inner.flush().await
     }
