@@ -790,6 +790,63 @@ mod tests {
     use super::*;
     use crate::null::Null;
 
+    /// Releasing one reference must preserve shared data until the last reference is removed.
+    #[maybe_async::test(feature = "sync", async(feature = "async", tokio::test))]
+    async fn test_reclaim_preserves_shared_cluster() {
+        use crate::test::mem_storage::{MemStorage, MemStorageState};
+        use crate::DenyImplicitOpenGate;
+
+        let state = Arc::new(MemStorageState::default());
+        let qcow2 = Qcow2::<MemStorage>::create_builder(MemStorage::new(Arc::clone(&state), false))
+            .cluster_size(4096)
+            .size(1024 * 1024)
+            .create_open(DenyImplicitOpenGate::default(), |s| {
+                Ok(Qcow2::<MemStorage>::builder(s).write(true).reclaim(true))
+            })
+            .await
+            .unwrap();
+        let mut allocator = qcow2.allocator().await.unwrap();
+        let allocation = allocator
+            .allocate_clusters(ClusterCount(1), None, false)
+            .await
+            .unwrap();
+        let cluster = allocation.cluster();
+        allocation.make_persistent();
+        let offset = cluster.offset(qcow2.header.cluster_bits()).0;
+        qcow2
+            .metadata
+            .write(&[0x5a; 4096][..], offset)
+            .await
+            .unwrap();
+        let (rt_index, rb_index) = cluster.rt_rb_indices(qcow2.header.rb_bits());
+        let rb = allocator.get_rb(rt_index).await.unwrap().unwrap();
+        rb.lock_write().await.increment(rb_index).unwrap();
+        assert_eq!(rb.get(rb_index), 2);
+
+        qcow2
+            .clusters_to_free
+            .push(ClustersToFreeEntry::data(cluster, ClusterCount(1)));
+        allocator.reclaim_clusters_to_free().await.unwrap();
+        assert_eq!(rb.get(rb_index), 1);
+        assert!(state.reclaimed.lock().is_empty());
+        let mut bytes = [0; 4096];
+        qcow2.metadata.read(&mut bytes[..], offset).await.unwrap();
+        assert!(bytes.iter().all(|b| *b == 0x5a));
+
+        qcow2
+            .clusters_to_free
+            .push(ClustersToFreeEntry::data(cluster, ClusterCount(1)));
+        allocator.reclaim_clusters_to_free().await.unwrap();
+        assert_eq!(rb.get(rb_index), 0);
+        assert_eq!(state.reclaimed.lock().len(), 1);
+        {
+            let reclaimed = state.reclaimed.lock();
+            assert_eq!((reclaimed[0].0, reclaimed[0].1), (offset, 4096));
+        }
+        drop(allocator);
+        qcow2.flush().await.unwrap();
+    }
+
     /// Regression test for a bug in `Allocator::grow_reftable()`'s free-space search loop: when it
     /// hit a reftable index that had no refblock at all (i.e. a range that has never been
     /// allocated), it `continue`d without advancing `rt_index` (the increment happened only at the
